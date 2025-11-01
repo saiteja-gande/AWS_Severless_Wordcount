@@ -1,0 +1,19 @@
+{
+    "Comment": "Word Count Step Function",
+    "StartAt": "WordCountProcessor",
+    "States": {
+      "WordCountProcessor": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:YOUR_REGION:YOUR_ACCOUNT_ID:function:WordCountProcessor",
+        "ResultPath": "$.lambda1Result",
+        "Next": "StoreWordCountResults"
+      },
+      "StoreWordCountResults": {
+        "Type": "Task",
+        "Resource": "arn:aws:lambda:YOUR_REGION:YOUR_ACCOUNT_ID:function:StoreWordCountResults",
+        "InputPath": "$.lambda1Result",
+        "End": true
+      }
+    }
+  }
+  
