@@ -43,26 +43,33 @@ When you upload a `.txt` file to an S3 bucket, the pipeline automatically counts
 ```
 aws-serverless-wordcount/
 │
-├── lambdas/                     # All Lambda functions + README
+├── lambdas/                           # All Lambda functions + README
 │   ├── WordCountProcessor.py
 │   ├── StoreWordCountResults.py
 │   ├── TriggerStepFunction.py
 │   └── README.md
 │
-├── step_function/               # State machine JSON + README
+├── step_function/                     # State machine JSON + README
 │   ├── state_machine_definition.json
 │   └── README.md
 │
-├── s3_setup/                    # Instructions for S3 bucket + Lambda trigger
+├── s3_setup/                          # Instructions for S3 bucket + Lambda trigger
 │   └── README.md
 │
-├── dynamodb_setup/              # Instructions for DynamoDB setup
+├── dynamodb_setup/                    # Instructions for DynamoDB setup
 │   └── README.md
 │
-├── sns_setup/                   # Instructions for SNS topic + subscription
+├── sns_setup/                         # Instructions for SNS topic + subscription
 │   └── README.md
 │
-└── README.md                    # (this file)
+|── Iac/                               # IaC deployments using CloudFormation and Terraform
+│   ├── CloudFormation/             
+│   │   |── serverless-wordcount.yaml  # CloudFormation template
+│   |   └── README.md
+|   |── Terraform/                     # Terraform configurations (Yet to be implemented)
+|
+|
+└── README.md                          # (this file)
 ```
 
 ---
@@ -132,6 +139,27 @@ was: 61
 If all three succeed, your pipeline is working perfectly 🎉
 
 ---
+
+## 🏗️ Infrastructure as Code (CloudFormation + Terraform)
+
+### ✅ CloudFormation Version:
+
+This repository now includes a fully automated deployment using **AWS CloudFormation**:
+
+📌 `IaC/CloudFormation/serverless-wordcount.yaml`  
+📌 `IaC/CloudFormation/README.md`  
+
+The CloudFormation version enables **full IaC deployment** without manual steps. For further information, refer to the CloudFormation README.
+
+### ⭐ Terraform Version: Coming Soon  
+A complete **Terraform version** of the infrastructure will be added later to provide:
+
+- Multi-cloud flexibility  
+- Module-based infrastructure design  
+- Easier CI/CD integration  
+
+---
+
 
 ## 💡 Optional Enhancements
 

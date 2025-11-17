@@ -1,0 +1,474 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Serverless Word Count Pipeline
+
+Resources:
+  ###########################################
+  # S3 Bucket
+  ###########################################
+  WordCountBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "wordcount-bucket-${AWS::AccountId}"
+
+  ###########################################
+  # SNS Topic
+  ###########################################
+  WordCountSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: WordCountTopic
+  
+  ###########################################
+  # SNS Email Subscription
+  ###########################################
+  WordCountSNSEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WordCountSNSTopic
+      Protocol: email
+      Endpoint: abc@abc.com  # Replace with your email address
+
+  ###########################################
+  # DynamoDB Table
+  ###########################################
+  WordCountTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: WordCountResults
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S  # Changed to String to avoid precision issues
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  ###########################################
+  # IAM Role for Lambda functions
+  ###########################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt WordCountBucket.Arn
+                  - !Sub "${WordCountBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref WordCountSNSTopic
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DescribeTable
+                Resource: !GetAtt WordCountTable.Arn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:WordCountStateMachine"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ###########################################
+  # Step Function Execution Role
+  ###########################################
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionInvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:WordCountProcessor"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:StoreWordCountResults"
+
+  ###########################################
+  # Lambda: Word Count Processor
+  ###########################################
+  WordCountProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: WordCountProcessor
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          snsTopicArn: !Ref WordCountSNSTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              # Retrieve event data from Step Function input
+              bucket = event['bucket']
+              key = event['key']
+              download_path = f"/tmp/{os.path.basename(key)}"
+              
+              s3.download_file(bucket, key, download_path)
+              
+              # Read file and count words
+              word_count = {}
+              with open(download_path, 'r', encoding='utf-8', errors='ignore') as file:
+                  for line in file:
+                      words = line.split()
+                      for word in words:
+                          word = word.lower().strip('.,!?;:"\'()[]{}')
+                          if word:
+                              word_count[word] = word_count.get(word, 0) + 1
+              
+              total_words = sum(word_count.values())
+              top_words = dict(sorted(word_count.items(), key=lambda x: x[1], reverse=True)[:10])
+              
+              # Create a string ID to avoid DynamoDB number precision issues
+              record_id = f"{int(datetime.utcnow().timestamp())}"
+              
+              # Prepare message for SNS
+              message = (
+                  f"File processed: {key}\n"
+                  f"Total word count: {total_words}\n\n"
+                  "Top 10 words:\n"
+              )
+              for w, c in top_words.items():
+                  message += f"  {w}: {c}\n"
+              
+              sns.publish(
+                  TopicArn=os.environ['snsTopicArn'],
+                  Subject=f"Word Count Report: {os.path.basename(key)}",
+                  Message=message
+              )
+              
+              # Pass result to next Lambda via Step Function output
+              return {
+                  'id': record_id,
+                  'file_name': key,
+                  'total_words': total_words,
+                  'top_words': top_words,
+                  'processed_at': datetime.utcnow().isoformat(),
+                  'processed_date': datetime.utcnow().date().isoformat()
+              }
+
+  ###########################################
+  # Lambda: Store Results in DynamoDB
+  ###########################################
+  StoreResultsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StoreWordCountResults
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          dynamoTableName: !Ref WordCountTable
+      Code:
+        ZipFile: | 
+          import boto3
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              table_name = os.environ['dynamoTableName']
+              table = dynamodb.Table(table_name)
+              
+              # The Step Function passes this payload from Lambda #1
+              record_id = event['id']
+              file_name = event['file_name']
+              total_words = event['total_words']
+              top_words = event['top_words']
+              processed_at = event['processed_at']
+              processed_date = event['processed_date']
+              
+              # Insert into DynamoDB
+              table.put_item(
+                  Item={
+                      'id': record_id,
+                      'file_name': file_name,
+                      'total_words': total_words,
+                      'top_words': top_words,
+                      'processed_at': processed_at,
+                      'processed_date': processed_date
+                  }
+              )
+              
+              print(f"Successfully stored record for {file_name} (ID: {record_id})")
+              
+              return {
+                  'status': 'success',
+                  'message': f"Stored results for {file_name}",
+                  'id': record_id
+              }
+
+  ###########################################
+  # Step Function State Machine
+  ###########################################
+  WordCountStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: WordCountStateMachine
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Serverless Word Count Pipeline",
+          "StartAt": "ProcessFile",
+          "States": {
+            "ProcessFile": {
+              "Type": "Task",
+              "Resource": "${WordCountProcessorLambda.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed"
+                }
+              ],
+              "Next": "StoreResults"
+            },
+            "StoreResults": {
+              "Type": "Task",
+              "Resource": "${StoreResultsLambda.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Error": "ProcessingError",
+              "Cause": "File processing failed"
+            }
+          }
+        }
+
+  ###########################################
+  # Lambda: Trigger Step Function
+  ###########################################
+  TriggerStepFunctionLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: WordCountStateMachine
+    Properties:
+      FunctionName: TriggerStepFunction
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:WordCountStateMachine"
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          
+          sf = boto3.client('stepfunctions')
+          
+          def lambda_handler(event, context):
+              print(json.dumps(event))
+              
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  
+                  # Skip if it's a folder or non-text file
+                  if key.endswith('/'):
+                      print(f"Skipping folder: {key}")
+                      continue
+                  
+                  # Start the Step Function execution
+                  response = sf.start_execution(
+                      stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                      input=json.dumps({'bucket': bucket, 'key': key})
+                  )
+                  print(f"Started Step Function: {response['executionArn']}")
+              
+              return {"status": "started"}
+
+  ###########################################
+  # Lambda Permission for S3 Notification
+  ###########################################
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerStepFunctionLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt WordCountBucket.Arn
+
+  ###########################################
+  # Custom Resource to Add S3 Notification
+  ###########################################
+  S3NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !GetAtt WordCountBucket.Arn
+
+  S3NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3NotificationConfigurator
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt S3NotificationLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  bucket = event['ResourceProperties']['Bucket']
+                  lambda_arn = event['ResourceProperties']['LambdaArn']
+                  
+                  if event['RequestType'] == 'Delete':
+                      # Remove notification on stack deletion
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Add notification configuration
+                  notification_config = {
+                      'LambdaFunctionConfigurations': [
+                          {
+                              'LambdaFunctionArn': lambda_arn,
+                              'Events': ['s3:ObjectCreated:*']
+                          }
+                      ]
+                  }
+                  
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket,
+                      NotificationConfiguration=notification_config
+                  )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  S3NotificationConfiguration:
+    Type: Custom::S3Notification
+    DependsOn:
+      - S3InvokePermission
+      - TriggerStepFunctionLambda
+    Properties:
+      ServiceToken: !GetAtt S3NotificationLambda.Arn
+      Bucket: !Ref WordCountBucket
+      LambdaArn: !GetAtt TriggerStepFunctionLambda.Arn
+
+  ###########################################
+  # CloudWatch Log Groups
+  ###########################################
+  TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/TriggerStepFunction
+      RetentionInDays: 7
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/WordCountProcessor
+      RetentionInDays: 7
+
+  StoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/StoreWordCountResults
+      RetentionInDays: 7
+
+Outputs:
+  BucketName:
+    Description: S3 bucket for word count files
+    Value: !Ref WordCountBucket
+    
+  SNSTopic:
+    Description: SNS topic for notifications
+    Value: !Ref WordCountSNSTopic
+    
+  DynamoDBTable:
+    Description: DynamoDB table storing results
+    Value: !Ref WordCountTable
+    
+  StepFunctionARN:
+    Description: Step Functions state machine ARN
+    Value: !Ref WordCountStateMachine
